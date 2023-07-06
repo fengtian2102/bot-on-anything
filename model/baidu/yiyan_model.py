@@ -1,118 +1,97 @@
 # encoding:utf-8
 
 from model.model import Model
-from config import model_conf
+from config import model_conf, common_conf_val
 from common import const
 from common.log import logger
 import requests
 import time
+import json
+import os
 
 sessions = {}
 
 class YiyanModel(Model):
     def __init__(self):
-        self.acs_token = model_conf(const.BAIDU).get('acs_token')
-        self.cookie = model_conf(const.BAIDU).get('cookie')
-        self.base_url = 'https://yiyan.baidu.com/eb'
+        self.base_url = "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions"
+        self.api_key = model_conf(const.BAIDU).get('api_key')
+        self.secret_key = model_conf(const.BAIDU).get('secret_key')
+        self.access_token_response = self.obtain_access_key()
+        self.ts = 1688529288
+        now = time.time()
+        if (now - self.ts) > int(self.access_token_response.get("expires_in",0)):
+            self.access_token_response = self.obtain_access_key()
+        self.access_token = self.access_token_response.get("access_token",None)
+
+    def obtain_access_key(self):
+        url = "https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=%s&client_secret=%s"%(self.api_key,self.secret_key)
+        payload = ""
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+        response = requests.request("POST", url, headers=headers, data=payload)
+        resp = json.loads(response.text)
+        return resp
+
+    def query(self, messages=[]):
+        payload = {
+            "messages": messages
+        }
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+        response = requests.request(
+            "POST", 
+            "%s?access_token=%s"%(self.base_url,self.access_token), 
+            headers = headers, 
+            data = json.dumps(payload,ensure_ascii=False).encode('utf-8')
+        )
+        logger.info("[BAIDU] response.text={}".format(response.text))
+        resp = json.loads(response.text)
+        return resp
 
     def reply(self, query, context=None):
+        logger.info("[BAIDU] context={}".format(json.dumps(context,ensure_ascii=False,indent=4)))
         logger.info("[BAIDU] query={}".format(query))
-        user_id = context.get('session_id') or context.get('from_user_id')
-        context['query'] = query
-
-        # 1.create session
-        chat_session_id = sessions.get(user_id)
-        if not chat_session_id:
-            self.new_session(context)
-            sessions[user_id] = context['chat_session_id']
+        from_user_id = context.get("from_user_id", "-1")
+        messages = self.read_history_messages(from_user_id)
+        message = {
+            "role":"user",
+            "content":query
+        }
+        messages.append(message)
+        clear_memory_commands = common_conf_val('clear_memory_commands', ['#清除记忆'])
+        reply_text = ""
+        if query in clear_memory_commands:
+            reply_text = "记忆已清除"
         else:
-            context['chat_session_id'] = chat_session_id
-
-        # 2.create chat
-        flag = self.new_chat(context)
-        if not flag:
-            return "创建会话失败，请稍后再试"
-
-        # 3.query
-        context['reply'] = ''
-        self.query(context, 0, 0)
-
-        return context['reply']
-
-
-    def new_session(self, context):
-        data = {
-            "sessionName": context['query'],
-            "timestamp": int(time.time() * 1000),
-            "deviceType": "pc"
+            resp = self.query(messages)
+            need_clear_history=resp.get("need_clear_history",False)
+            if need_clear_history:
+                reply_text = "输入存在安全风险，已清理本次历史会话信息"
+            else:
+                reply_text=resp.get("result","")
+        message = {
+            "role":"assistant",
+            "content":reply_text
         }
-        res = requests.post(url=self.base_url+'/session/new', headers=self._create_header(), json=data)
-        # print(res.headers)
-        context['chat_session_id'] = res.json()['data']['sessionId']
-        logger.info("[BAIDU] newSession: id={}".format(context['chat_session_id']))
+        messages.append(message)
+        self.write_history_message(from_user_id, messages)
+        return reply_text
 
+    def read_history_messages(self, from_user_id):
+        p = os.path.join(os.path.dirname(__file__),"../../")
+        message_data_dir = os.path.join(p,"data","%s.txt"%(from_user_id))
+        messages=[]
+        if os.path.exists(message_data_dir):
+            with open(message_data_dir,"r") as fr:
+                messages = json.loads(fr.read())
+        return messages
 
-    def new_chat(self, context):
-        headers = self._create_header()
-        headers['Acs-Token'] = self.acs_token
-        data = {
-            "sessionId": context.get('chat_session_id'),
-            "text": context['query'],
-            "parentChatId": 0,
-            "type": 10,
-            "timestamp": int(time.time() * 1000),
-            "deviceType": "pc",
-            "code": 0,
-            "msg": ""
-        }
-        res = requests.post(url=self.base_url+'/chat/new', headers=headers, json=data).json()
-        if res['code'] != 0:
-            logger.error("[BAIDU] New chat error, msg={}", res['msg'])
-            return False
-        context['chat_id'] = res['data']['botChat']['id']
-        context['parent_chat_id'] = res['data']['botChat']['parent']
-        return True
-
-
-    def query(self, context, sentence_id, count):
-        headers = self._create_header()
-        headers['Acs-Token'] = self.acs_token
-        data = {
-            "chatId": context['chat_id'],
-            "parentChatId": context['parent_chat_id'],
-            "sentenceId": sentence_id,
-            "stop": 0,
-            "timestamp": 1679068791405,
-            "deviceType": "pc"
-        }
-        res = requests.post(url=self.base_url + '/chat/query', headers=headers, json=data)
-        logger.debug("[BAIDU] query: sent_id={}, count={}, res={}".format(sentence_id, count, res.text))
-
-        res = res.json()
-        if res['data']['text'] != '':
-            context['reply'] += res['data']['text']
-            # logger.debug("[BAIDU] query: sent_id={}, reply={}".format(sentence_id, res['data']['text']))
-
-        if res['data']['is_end'] == 1:
-            return
-
-        if count > 10:
-            return
-
-        time.sleep(1)
-        if not res['data']['text']:
-            return self.query(context, sentence_id, count+1)
-        else:
-            return self.query(context, sentence_id+1, count+1)
-
-
-    def _create_header(self):
-        headers = {
-            'Host': 'yiyan.baidu.com',
-            'Origin': 'https://yiyan.baidu.com',
-            'Referer': 'https://yiyan.baidu.com',
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/105.0.0.0 Safari/537.36',
-            'Content-Type': 'application/json',
-            'Cookie': self.cookie
-        }
-        return headers
+    def write_history_message(self, from_user_id, messages):
+        p = os.path.join(os.path.dirname(__file__),"../../")
+        message_data_dir = os.path.join(p,"data","%s.txt"%(from_user_id))
+        with open(message_data_dir,"w") as fw:
+            fw.write(json.dumps(messages, ensure_ascii=False, indent=4))

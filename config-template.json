@@ -15,7 +15,9 @@
     },
     "baidu": {
       "acs_token": "YOUR ACS TOKEN",
-      "cookie": "YOUR COOKIE"
+      "cookie": "YOUR COOKIE",
+      "api_key": "YOUR AK",
+      "secret_key": "YOUR SK"
     },
     "bard": {
       "cookie": "YOUR COOKIE"
